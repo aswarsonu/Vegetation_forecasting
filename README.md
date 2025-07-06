@@ -16,3 +16,10 @@
 python train.py seed=42.yaml --data_dir /path/to/data_sample
 
 
+## Usage
+
+1. **Edit the checkpoint path**  
+   In `my_contextformer.py`, make sure you point `--clip_checkpoint` (and any other `checkpoint` args) at the folder or file where you’ve stored your pretrained weights. Example:  
+   ```python
+   # inside my_contextformer.py
+   CLIP_CHECKPOINT = "/path/to/your/checkpoint-169410"
