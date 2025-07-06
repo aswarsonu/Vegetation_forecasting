@@ -7,11 +7,11 @@
 
 - **Sample data**  
   [Google Drive – data_sample folder](https://drive.google.com/drive/folders/1YKF5ce5w3SfkaVZftg_fDCzIwo88B_2J?usp=sharing)
-
+**## Conda environment**
+environment.yaml
 ## Training
 
 ```bash
 python train.py seed=42.yaml --data_dir /path/to/data_sample
 
-**## Conda environment**
-environment.yaml
+
