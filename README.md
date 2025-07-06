@@ -12,3 +12,6 @@
 
 ```bash
 python train.py seed=42.yaml --data_dir /path/to/data_sample
+
+**## Conda environment**
+environment.yaml
