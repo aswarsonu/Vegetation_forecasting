@@ -23,7 +23,9 @@ python train.py seed=42.yaml --data_dir /path/to/data_sample
    ```python
    # inside my_contextformer.py
    CLIP_CHECKPOINT = "/path/to/your/checkpoint-169410"
-## Configuration
+
+
+2. ## Configuration
 
 All model- and training-hyperparameters live in the YAML file:
 
