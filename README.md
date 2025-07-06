@@ -7,8 +7,9 @@
 
 - **Sample data**  
   [Google Drive – data_sample folder](https://drive.google.com/drive/folders/1YKF5ce5w3SfkaVZftg_fDCzIwo88B_2J?usp=sharing)
-**## Conda environment**
-environment.yaml
+  
+## Conda environment
+**environment.yaml**
 ## Training
 
 ```bash
