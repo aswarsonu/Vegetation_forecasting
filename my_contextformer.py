@@ -38,6 +38,8 @@ from layers.SelfAttention_Family import FullAttention, AttentionLayer
 from layers.Embed import DataEmbedding_inverted
 from transformers import AutoModel, AutoTokenizer
 import os
+
+from graph import gwnet
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
 from pathlib import Path
@@ -50,6 +52,10 @@ from transformers import (
     CLIPModel,
     CLIPConfig,
 )
+
+
+
+
 
 
 class Attention(nn.Module):
@@ -199,8 +205,8 @@ class CLIPTextEncoder(nn.Module):
     """
     Lightweight wrapper around CLIP’s text encoder.
     Loads either a Hugging‑Face‑style folder (config + weights) or a bare
-    weights file under `clip_checkpoint`.  Exposes `self.processor`
-    and `self.clip` so that upstream models can reuse them.
+    weights file under clip_checkpoint.  Exposes self.processor
+    and self.clip so that upstream models can reuse them.
     """
 
     def __init__(self,
@@ -584,7 +590,24 @@ class ContextFormer(nn.Module):
             ]
         )
 
-        
+        # grid + adjacency
+        self.side       = hparams.image_size // hparams.patch_size   # e.g. 32
+        self.num_nodes  = self.side * self.side                      # 1024
+
+        support = self._make_grid_adj(self.side).float()             # keep on CPU for now
+        self.register_buffer('support', support)                     # will move with .to(...)
+
+        # Graph WaveNet
+        self.gwn = gwnet(
+            device    = torch.device("cuda"),   # or just x.device later
+            num_nodes = self.num_nodes,
+            in_dim    = hparams.n_hidden,
+            out_dim   = hparams.n_hidden,
+            dropout   = hparams.dropout,
+            supports  = [self.support],         # use the buffer
+            gcn_bool  = True,
+            addaptadj = True,
+        )
         self.head = Mlp(
             in_features=self.hparams.n_hidden,
             hidden_features=self.hparams.n_hidden,
@@ -613,7 +636,17 @@ class ContextFormer(nn.Module):
         
 
         
-        
+
+    def _make_grid_adj(self, g):
+        """Return a (g² × g²) 0/1 tensor, 1 if 4-neighbour."""
+        adj = torch.zeros(g * g, g * g)
+        for p in range(g * g):
+            r, c = divmod(p, g)
+            if r > 0:    adj[p, (r-1)*g + c] = 1
+            if r < g-1:  adj[p, (r+1)*g + c] = 1
+            if c > 0:    adj[p, r*g + c-1]   = 1
+            if c < g-1:  adj[p, r*g + c+1]   = 1
+        return adj    
 
     @staticmethod
     def add_model_specific_args(
@@ -657,7 +690,9 @@ class ContextFormer(nn.Module):
                    help="dropout rate for all iTransformer blocks")       
         parser.add_argument("--clip_checkpoint", type=str, default="/storage/ij_sonu/checkpoint-169410", help="Path to your fine-tuned CLIP checkpoint folder")
         parser.add_argument("--use_itransformer",type=str2bool, default=False)
+        parser.add_argument("--image_size", type=int, default=128)
         return parser
+
 
     def forward(self, data, pred_start: int = 0, preds_length: Optional[int] = None):
 
@@ -747,13 +782,13 @@ class ContextFormer(nn.Module):
                 B, patches_per_img, T, emb.shape[2]
             ).reshape(B * patches_per_img, T, emb.shape[2])     
 
-        B_patch, N_patch, _ = image_patches_embed.shape
-        patches_per_img     = (H // self.hparams.patch_size) * (W // self.hparams.patch_size)
-        B                   = B_patch // patches_per_img
-
+        B_patch, T, D   = image_patches_embed.shape
+        patches_per_img = self.num_nodes                   # 32×32 = 1024
+        B               = B_patch // patches_per_img
+        N_patch         = patches_per_img                  # keep the name for clarity
+        # print("image patches embed", image_patches_embed.shape)
         # caption Embeddings
-
-#### ─────────────────────────── caption processing (CLIP)───────────────────────────────────── #####
+       #### ─────────────────────────── caption processing (CLIP)───────────────────────────────────── #####
                 
         raw_caps = data.get("llama_caption", [[""] * T for _ in range(B)])
         caps = []
@@ -771,7 +806,7 @@ class ContextFormer(nn.Module):
                                     .reshape(B_patch, T, -1)
 
 
-
+        # print("cap patches", cap_patch.shape)
         # getting weather patches
         weather_patches = (
             weather.unsqueeze(1)                        # [B,1,30,24]
@@ -782,15 +817,19 @@ class ContextFormer(nn.Module):
                                         # [B,T,C+3,H,W]
 
     
+
+    
         
 
 #### ─────────────────────────── Add Token Mask (Same from baseline) ───────────────────────────────────── #####
        
-        token_mask = torch.zeros(B_patch, N_patch, dtype=torch.bool, device=device)
+        token_mask = torch.zeros(B_patch, T, dtype=torch.bool, device=device)
+
         if self.hparams.mtm and self.training:
             rand = torch.rand_like(token_mask.float())
             token_mask = rand < self.hparams.p_mtm
-            token_mask[:, : self.hparams.leave_n_first] = False           # keep first tokens
+            token_mask[:, : self.hparams.leave_n_first] = False        # keep first N frames
+
         token_mask = token_mask.unsqueeze(-1).expand(-1, -1, self.hparams.n_hidden)
 
         if self.hparams.mask_clouds:
@@ -813,53 +852,73 @@ class ContextFormer(nn.Module):
             patches_embed = image_patches_embed + weather_patches_embed + cap_patch  # (B_p,T,H)
         else:
             patches_embed = image_patches_embed
-
+        # print("patches embed", patches_embed.shape)
         # Add Positional Embedding
         pos_embed = (
-            get_sinusoid_encoding_table(N_patch, self.hparams.n_hidden)
+            get_sinusoid_encoding_table(T, self.hparams.n_hidden)  # ← use T, not N_patch
             .to(patches_embed.device)
-            .unsqueeze(0)
-            .repeat(B_patch, 1, 1)
+            .unsqueeze(0)                                        # [1 , T , D]
+            .repeat(B_patch, 1, 1)                               # [B·N , T , D]
         )
-        x = patches_embed + pos_embed
-        
 
-#### ─────────────────────────── Transformer Block ───────────────────────────────────── #####
-        # Using Contextformer 
-        for blk in self.blocks:  
-            x = blk(x)
-       
+        # print("pos embed", pos_embed.shape)
+        x = patches_embed + pos_embed
+        # print("x shape", x.shape)
+
+        # ─── Graph-WaveNet block ──────────────────────────────────────────────
+        # x:  [B_p, T, D] where B_p = B * num_nodes
+
+        # ---------- Graph-WaveNet block  ------------------------------------
+        B_p, T, D = x.shape                 # [B·N, 30, 256]
+        B        = B_p // self.num_nodes    # recover mini-batch
+        N        = self.num_nodes           # 1024 (= 32×32)
+
+        # 1)  [B , N , T , D]  →  [B , D , N , T]
+        x_gwn = (x.view(B, N, T, D)         # regroup patches per sample
+                    .permute(0, 3, 1, 2)    # channels-first for conv1d
+                    .contiguous())
+
+        # 2) run the graph WaveNet (keeps length T)
+        x_gwn = self.gwn(x_gwn)             # [B , D , N , T' ]  (T' == T)
+        x_gwn = x_gwn[:, :, :, :T] 
+        # (if your GWN happens to spit out one extra step, crop it)
+        # x_gwn = x_gwn[..., :T]
+
+        # 3)  [B , D , N , T]  →  [B , N , T , D]  →  [B·N , T , D]
+        x = (x_gwn.permute(0, 2, 3, 1)      # back to node-major
+                .contiguous()
+                .view(B_p, T, D))        # collapse nodes into batch
+# --------------------------------------------------------------------
+        # print("x shape after graph block:", x.shape)
         # Decode image patches
         x_out = self.head(x)
-
+        # print("x out" ,x_out.shape)
         
+        
+        B_p, T_, Cpp = x_out.shape
+        C   = self.hparams.n_out
+        p   = self.hparams.patch_size
+        P   = patches_per_img                # we’ve already got it
+        H, W = hr_dynamic_inputs.shape[-2:]  # original spatial size
 
-        # Mask Non-masked inputs
-        x_out[
-            ~token_mask.bool()[
-                :,
-                :,
-                : self.hparams.n_out
-                * self.hparams.patch_size
-                * self.hparams.patch_size,
-            ]
-        ] = -1
+        # ------- restore the 2-D patch grid ----------------------------------------
+        # [B·P , T , C·p²] → [B , P , T , C , p , p]
+        x_out = x_out.view(B, P, T_, C, p, p)
 
-        # unpatchify images
-        images_out = (
-            x_out.reshape(
-                B,
-                H // self.hparams.patch_size,
-                W // self.hparams.patch_size,
-                N_patch,
-                self.hparams.n_out,
-                self.hparams.patch_size,
-                self.hparams.patch_size,
-            )
-            .permute(0, 3, 4, 1, 5, 2, 6)
-            .reshape(B, N_patch, self.hparams.n_out, H, W)
-        )
-       
+        # ------- split P back into (H/p, W/p) --------------------------------------
+        x_out = x_out.view(B,
+                        H // p, W // p,   # patch grid
+                        T_, C, p, p)
+
+        # ------- bring axes to (B, T, C, H, W) & collapse --------------------------
+        images_out = (x_out.permute(0,            # B
+                                    3,            # T
+                                    4,            # C
+                                    1, 5,         # H//p , p  → H
+                                    2, 6)         # W//p , p  → W
+                        .contiguous()
+                        .view(B, T_, C, H, W))
+        N_patch = images_out.shape[1]
 #### ─────────────────────────── Same from baseline code  ───────────────────────────────────── #####
         if self.hparams.add_last_ndvi:
             mask = hr_dynamic_mask[:, :c_l, ...]
@@ -946,4 +1005,4 @@ class ContextFormer(nn.Module):
                 .permute(2, 0, 1, 3, 4)
             )
   
-        return images_out, {}
+        return images_out, {} 
